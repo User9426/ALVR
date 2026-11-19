@@ -15,9 +15,10 @@ jobs:
           submodules: true
 
       - name: Install dependencies
-        uses: crazy-max/ghaction-chocolatey@v4
-        with:
-          args: install zip unzip pkgconfiglite
+        shell: pwsh
+        run: |
+          choco install zip unzip pkgconfiglite -y
+          echo "C:\ProgramData\chocolatey\bin" >> $env:GITHUB_PATH
 
       - name: Build Windows Streamer
         shell: pwsh
