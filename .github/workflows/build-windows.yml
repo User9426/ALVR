@@ -1,0 +1,33 @@
+name: Build Windows Streamer
+
+on:
+  push:
+    branches: [ idle-fix ]
+  workflow_dispatch:
+
+jobs:
+  build_windows_streamer:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install dependencies
+        uses: crazy-max/ghaction-chocolatey@v4
+        with:
+          args: install zip unzip pkgconfiglite
+
+      - name: Build Windows Streamer
+        shell: pwsh
+        env:
+          RUST_BACKTRACE: 1
+        run: |
+          cargo xtask package-streamer --gpl --ci
+
+      - name: Upload Windows Streamer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-streamer
+          path: ./build/alvr_streamer_windows.zip
