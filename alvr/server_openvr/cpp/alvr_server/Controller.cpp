@@ -121,6 +121,7 @@ void Controller::RegisterButton(uint64_t id) {
             vr::VRDriverInput()->CreateBooleanComponent(
                 this->prop_container, path, &m_buttonHandles[PathStringToHash(path)]
             );
+            m_buttonIsBinary[PathStringToHash(path)] = true;
         }
     } else {
         auto scalarType = buttonInfo.type == ButtonType::ScalarOneSided
@@ -135,8 +136,38 @@ void Controller::RegisterButton(uint64_t id) {
                 vr::VRScalarType_Absolute,
                 scalarType
             );
+            m_buttonIsBinary[PathStringToHash(path)] = false;
         }
     }
+}
+
+// Reset every input component to its neutral value.
+//
+// When a controller's pose source drops out, the client also stops sending
+// button/axis events, so SteamVR keeps serving whatever value arrived last.
+// Upstream gets away with that because the device simultaneously reports
+// deviceIsConnected = false and games discard its input. While we hold the
+// pose we are claiming the opposite, so anything left pressed would still be
+// honoured -- a thumbstick held forward would keep walking the player. Clear
+// it all explicitly on the way into a hold.
+void Controller::ReleaseAllInputs() {
+    auto input = vr::VRDriverInput();
+
+    for (auto& entry : m_buttonHandles) {
+        auto isBinary = m_buttonIsBinary.find(entry.first);
+        if (isBinary != m_buttonIsBinary.end() && isBinary->second) {
+            input->UpdateBooleanComponent(entry.second, false, 0.0);
+        } else {
+            // Neutral for both one-sided (trigger, grip) and two-sided
+            // (thumbstick axis) scalars.
+            input->UpdateScalarComponent(entry.second, 0.0f, 0.0);
+        }
+    }
+
+    m_currentThumbTouch = false;
+    m_currentTriggerTouch = false;
+    m_triggerValue = 0;
+    m_gripValue = 0;
 }
 
 void Controller::SetButton(uint64_t id, FfiButtonValue value) {
@@ -184,8 +215,14 @@ bool Controller::OnPoseUpdate(uint64_t targetTimestampNs, float predictionS, Ffi
         && (device_id == HAND_TRACKER_LEFT_ID || device_id == HAND_TRACKER_RIGHT_ID);
     bool enabledAsController
         = !handData.isHandTracker && (device_id == HAND_LEFT_ID || device_id == HAND_RIGHT_ID);
-    bool enabled = (controllerMotion != nullptr || handSkeleton != nullptr)
-        && (enabledAsHandTracker || enabledAsController);
+    // Does this device currently own its hand? ALVR registers two devices per
+    // hand (a controller and a hand tracker) and picks between them at runtime
+    // by setting deviceIsConnected -- see the comment above SetTracking in
+    // server_openvr/src/lib.rs. Whichever device does NOT own the hand must
+    // keep reporting itself disconnected, or both twins claim the same hand.
+    bool roleActive = enabledAsHandTracker || enabledAsController;
+    bool haveSample = (controllerMotion != nullptr || handSkeleton != nullptr);
+    bool enabled = haveSample && roleActive;
 
     Debug(
         "%s %s: enabled: %d, ctrl: %d, hand: %d",
@@ -196,6 +233,111 @@ bool Controller::OnPoseUpdate(uint64_t targetTimestampNs, float predictionS, Ffi
         handData.controllerMotion != nullptr,
         handData.handSkeleton != nullptr
     );
+
+    // -------------------------------------------------------------------
+    // Idle-hold.
+    //
+    // When a Touch controller's pose source goes quiet (set down, firmware
+    // asleep), upstream publishes a zero-initialised DriverPose_t with
+    // deviceIsConnected = false. That tells SteamVR the controller was
+    // UNPLUGGED, and VRChat responds to an unplugged controller by animating
+    // the arm back to the avatar's default pose -- so the hand, and any UI
+    // parented to it, jumps away.
+    //
+    // Instead, briefly freeze: re-publish the last good pose with the device
+    // still connected, velocities zeroed so nothing drifts.
+    //
+    // Two things make this safe, and both are load-bearing:
+    //
+    // 1. Only hold while this device still OWNS its hand (roleActive). ALVR
+    //    arbitrates between the controller and hand-tracker twins using
+    //    deviceIsConnected, so a deselected twin that keeps claiming to be
+    //    connected leaves two devices fighting over one hand.
+    //
+    // 2. Neutralise inputs on the way in. The client stops sending button
+    //    and axis events during a dropout, so SteamVR would otherwise keep
+    //    serving the last value it saw -- and because we are now claiming
+    //    the device is connected, the game would act on it. A thumbstick
+    //    held forward would keep walking the player, with no way to stop.
+    // -------------------------------------------------------------------
+    if (enabled) {
+        if (m_holdingLastPose) {
+            // Report how long the hold actually lasted. Logging only the start
+            // of a hold and its timeout leaves normal recoveries invisible,
+            // which makes a 300 ms blip indistinguishable from a 4 s outage
+            // when reading session_log.txt afterwards.
+            uint64_t heldNs = (targetTimestampNs > m_lastEnabledTimestampNs)
+                ? targetTimestampNs - m_lastEnabledTimestampNs
+                : 0;
+            Warn(
+                "controller %s: source recovered after %llu ms, hold released",
+                (device_id == HAND_TRACKER_LEFT_ID || device_id == HAND_LEFT_ID) ? "left" : "right",
+                (unsigned long long)(heldNs / 1000000ULL)
+            );
+        }
+        m_lastEnabledTimestampNs = targetTimestampNs;
+        m_holdingLastPose = false;
+        m_inputsReleased = false;
+    } else {
+        if (!m_inputsReleased) {
+            ReleaseAllInputs();
+            m_inputsReleased = true;
+        }
+
+        bool canHold = roleActive && this->last_pose.poseIsValid
+            && this->last_pose.deviceIsConnected && m_lastEnabledTimestampNs != 0
+            && targetTimestampNs > m_lastEnabledTimestampNs
+            && (targetTimestampNs - m_lastEnabledTimestampNs) < IDLE_HOLD_TIMEOUT_NS;
+
+        if (canHold) {
+            auto held = this->last_pose;
+            held.poseIsValid = true;
+            held.deviceIsConnected = true;
+            held.result = vr::TrackingResult_Running_OK;
+
+            for (int i = 0; i < 3; i++) {
+                held.vecVelocity[i] = 0.0;
+                held.vecAngularVelocity[i] = 0.0;
+                held.vecAcceleration[i] = 0.0;
+                held.vecAngularAcceleration[i] = 0.0;
+            }
+
+            held.poseTimeOffset = predictionS;
+
+            if (!m_holdingLastPose) {
+                // Warn, not Debug: Debug() is compiled out entirely in release
+                // builds (ALVR_DEBUG_LOG is only defined under
+                // debug_assertions), which would make holds invisible in
+                // session_log.txt.
+                Warn(
+                    "controller %s: source inactive, holding last pose",
+                    (device_id == HAND_TRACKER_LEFT_ID || device_id == HAND_LEFT_ID) ? "left"
+                                                                                     : "right"
+                );
+                m_holdingLastPose = true;
+            }
+
+            this->submit_pose(held);
+            m_poseTargetTimestampNs = targetTimestampNs;
+
+            // Skip the skeleton update, matching the existing disabled path.
+            return false;
+        }
+
+        if (m_holdingLastPose) {
+            uint64_t heldNs = (targetTimestampNs > m_lastEnabledTimestampNs)
+                ? targetTimestampNs - m_lastEnabledTimestampNs
+                : 0;
+            Warn(
+                "controller %s: hold timed out after %llu ms, releasing device "
+                "(if this repeats, check the controller battery)",
+                (device_id == HAND_TRACKER_LEFT_ID || device_id == HAND_LEFT_ID) ? "left" : "right",
+                (unsigned long long)(heldNs / 1000000ULL)
+            );
+            m_holdingLastPose = false;
+        }
+        // Fall through to the stock disabled path: deviceIsConnected = false.
+    }
 
     auto vr_driver_input = vr::VRDriverInput();
 
