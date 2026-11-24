@@ -52,6 +52,7 @@ private:
     // Tracks which registered components are boolean, so a dropout can reset
     // each one to its correct neutral value.
     std::map<uint64_t, bool> m_buttonIsBinary;
+    std::map<uint64_t, bool> m_buttonIsTouch;
 
     // These variables are used for controller hand animation
     // todo: move to rust
