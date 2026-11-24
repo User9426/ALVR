@@ -122,6 +122,8 @@ void Controller::RegisterButton(uint64_t id) {
                 this->prop_container, path, &m_buttonHandles[PathStringToHash(path)]
             );
             m_buttonIsBinary[PathStringToHash(path)] = true;
+            m_buttonIsTouch[PathStringToHash(path)] =
+                (std::string(path).find("/touch") != std::string::npos);
         }
     } else {
         auto scalarType = buttonInfo.type == ButtonType::ScalarOneSided
@@ -154,6 +156,11 @@ void Controller::ReleaseAllInputs() {
     auto input = vr::VRDriverInput();
 
     for (auto& entry : m_buttonHandles) {
+        auto isTouch = m_buttonIsTouch.find(entry.first);
+        if (isTouch != m_buttonIsTouch.end() && isTouch->second) {
+            continue;
+        }
+
         auto isBinary = m_buttonIsBinary.find(entry.first);
         if (isBinary != m_buttonIsBinary.end() && isBinary->second) {
             input->UpdateBooleanComponent(entry.second, false, 0.0);
@@ -164,8 +171,6 @@ void Controller::ReleaseAllInputs() {
         }
     }
 
-    m_currentThumbTouch = false;
-    m_currentTriggerTouch = false;
     m_triggerValue = 0;
     m_gripValue = 0;
 }
